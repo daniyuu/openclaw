@@ -47,7 +47,7 @@ const CHANNELS = 2;
 const BIT_DEPTH = 16;
 const MIN_SEGMENT_SECONDS = 0.35;
 const SILENCE_DURATION_MS = 1_000;
-const PLAYBACK_READY_TIMEOUT_MS = 15_000;
+const PLAYBACK_READY_TIMEOUT_MS = 60_000; // 增加到 60 秒,网络条件差时需要更长时间
 const SPEAKING_READY_TIMEOUT_MS = 60_000;
 const DECRYPT_FAILURE_WINDOW_MS = 30_000;
 const DECRYPT_FAILURE_RECONNECT_THRESHOLD = 3;
@@ -332,10 +332,13 @@ export class DiscordVoiceManager {
         }
         seenGuilds.add(guildId);
         logVoiceVerbose(`autoJoin: joining guild ${guildId} channel ${entry.channelId}`);
-        await this.join({
+        const result = await this.join({
           guildId: entry.guildId,
           channelId: entry.channelId,
         });
+        if (!result.ok) {
+          logger.warn(`discord voice: autoJoin failed for guild ${guildId}: ${result.message}`);
+        }
       }
     })().finally(() => {
       this.autoJoinTask = null;
@@ -411,12 +414,54 @@ export class DiscordVoiceManager {
       selfMute: false,
       daveEncryption,
       decryptionFailureTolerance,
+      debug: true,
+    });
+
+    // Log connection state changes for debugging
+    connection.on("stateChange", (oldState, newState) => {
+      logger.info(
+        `discord voice: connection state ${oldState.status} → ${newState.status} (guild ${guildId})`,
+      );
+
+      // Log detailed networking state when connection fails
+      if (
+        newState.status === VoiceConnectionStatus.Signalling &&
+        oldState.status === VoiceConnectionStatus.Connecting
+      ) {
+        logger.warn(
+          `discord voice: connection dropped from connecting → signalling. This usually means the voice WebSocket was closed or UDP failed.`,
+        );
+      }
+
+      // Log networking code (safe extraction, avoid circular refs)
+      interface VoiceStateNetworking {
+        networking?: {
+          state?: {
+            code?: number;
+          };
+        };
+      }
+      const networkingCode = (newState as VoiceStateNetworking).networking?.state?.code;
+      if (networkingCode !== undefined) {
+        logger.info(`discord voice: networking code = ${networkingCode}`);
+      }
+    });
+
+    // Log networking debug/error for diagnosing voice gateway issues
+    connection.on("debug", (msg: string) => {
+      logger.info(`discord voice debug: ${msg}`);
+    });
+    connection.on("error", (err: Error) => {
+      logger.warn(`discord voice error: ${err.message}`);
     });
 
     try {
       await entersState(connection, VoiceConnectionStatus.Ready, PLAYBACK_READY_TIMEOUT_MS);
-      logVoiceVerbose(`join: connected to guild ${guildId} channel ${channelId}`);
+      logger.info(`discord voice: join: connected to guild ${guildId} channel ${channelId}`);
     } catch (err) {
+      logger.warn(
+        `discord voice: join failed for guild ${guildId} channel ${channelId}: ${formatErrorMessage(err)} (connection state: ${connection.state.status})`,
+      );
       connection.destroy();
       return { ok: false, message: `Failed to join voice channel: ${formatErrorMessage(err)}` };
     }
@@ -489,17 +534,46 @@ export class DiscordVoiceManager {
     };
 
     disconnectedHandler = async () => {
+      logger.warn(
+        `discord voice: disconnected from guild ${guildId} channel ${channelId}; waiting for reconnect…`,
+      );
       try {
         await Promise.race([
           entersState(connection, VoiceConnectionStatus.Signalling, 5_000),
           entersState(connection, VoiceConnectionStatus.Connecting, 5_000),
         ]);
+        logger.info(`discord voice: reconnecting to guild ${guildId} channel ${channelId}`);
       } catch {
+        logger.warn(
+          `discord voice: failed to reconnect guild ${guildId} channel ${channelId}; destroying connection`,
+        );
         clearSessionIfCurrent();
         connection.destroy();
+        // Auto-rejoin if this channel is in the autoJoin list
+        const autoJoinEntries = this.params.discordConfig.voice?.autoJoin ?? [];
+        const shouldAutoRejoin = autoJoinEntries.some(
+          (e) => e.guildId === guildId && e.channelId === channelId,
+        );
+        if (shouldAutoRejoin) {
+          logger.info(
+            `discord voice: scheduling auto-rejoin for guild ${guildId} channel ${channelId}`,
+          );
+          setTimeout(() => {
+            void this.join({ guildId, channelId }).then((result) => {
+              if (result.ok) {
+                logger.info(`discord voice: auto-rejoin succeeded for guild ${guildId}`);
+              } else {
+                logger.warn(
+                  `discord voice: auto-rejoin failed for guild ${guildId}: ${result.message}`,
+                );
+              }
+            });
+          }, 3_000);
+        }
       }
     };
     destroyedHandler = () => {
+      logger.info(`discord voice: connection destroyed for guild ${guildId} channel ${channelId}`);
       clearSessionIfCurrent();
     };
     playerErrorHandler = (err: Error) => {
@@ -546,6 +620,64 @@ export class DiscordVoiceManager {
       entry.stop();
     }
     this.sessions.clear();
+  }
+
+  /**
+   * Speak text in a voice channel (for text-to-voice replies)
+   */
+  async speakText(params: { guildId: string; text: string }): Promise<VoiceOperationResult> {
+    const { guildId, text } = params;
+    const entry = this.sessions.get(guildId);
+    if (!entry) {
+      return { ok: false, message: "Not connected to a voice channel in that guild." };
+    }
+
+    const { cfg: ttsCfg, resolved: ttsConfig } = resolveVoiceTtsConfig({
+      cfg: this.params.cfg,
+      override: this.params.discordConfig.voice?.tts,
+    });
+    const directive = parseTtsDirectives(text, ttsConfig.modelOverrides, ttsConfig.openai.baseUrl);
+    const speakText = directive.overrides.ttsText ?? directive.cleanedText.trim();
+    if (!speakText) {
+      return { ok: false, message: "No text to speak after TTS processing." };
+    }
+
+    const ttsResult = await textToSpeech({
+      text: speakText,
+      cfg: ttsCfg,
+      channel: "discord",
+      overrides: directive.overrides,
+    });
+    if (!ttsResult.success || !ttsResult.audioPath) {
+      return { ok: false, message: `TTS failed: ${ttsResult.error ?? "unknown error"}` };
+    }
+
+    const audioPath = ttsResult.audioPath;
+    logVoiceVerbose(
+      `tts ok (${speakText.length} chars): guild ${entry.guildId} channel ${entry.channelId}`,
+    );
+
+    this.enqueuePlayback(entry, async () => {
+      logVoiceVerbose(
+        `playback start: guild ${entry.guildId} channel ${entry.channelId} file ${path.basename(audioPath)}`,
+      );
+      const resource = createAudioResource(audioPath);
+      entry.player.play(resource);
+      await entersState(entry.player, AudioPlayerStatus.Playing, PLAYBACK_READY_TIMEOUT_MS).catch(
+        () => undefined,
+      );
+      await entersState(entry.player, AudioPlayerStatus.Idle, SPEAKING_READY_TIMEOUT_MS).catch(
+        () => undefined,
+      );
+      logVoiceVerbose(`playback done: guild ${entry.guildId} channel ${entry.channelId}`);
+    });
+
+    return {
+      ok: true,
+      message: `Speaking in ${formatMention({ channelId: entry.channelId })}.`,
+      guildId: entry.guildId,
+      channelId: entry.channelId,
+    };
   }
 
   private enqueueProcessing(entry: VoiceSessionEntry, task: () => Promise<void>) {
